@@ -424,7 +424,15 @@ func openCache(ttl, ttlAvail time.Duration) *cache {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil
 	}
-	return &cache{dir: dir, ttl: ttl, ttlAvail: ttlAvail}
+	return &cache{
+		dir:      dir,
+		ttl:      ttl,
+		ttlAvail: ttlAvail,
+		hits: map[string]*atomic.Int64{
+			cacheDomains: new(atomic.Int64),
+			cacheServers: new(atomic.Int64),
+		},
+	}
 }
 
 func (c *cache) path(kind, key string) string {
@@ -462,7 +470,7 @@ func (c *cache) getFresh(kind, key string, out any, ttl time.Duration) bool {
 	if !ok || ttl <= 0 || age > ttl {
 		return false
 	}
-	c.hits.Add(1)
+	c.hit(kind)
 	return true
 }
 
@@ -541,11 +549,9 @@ func hunt(keyword string, tlds []string, cfg config) {
 	byServer := resolveServers(keyword, tlds, servers, cfg, p)
 	queryAll(byServer, cfg, p)
 
-	if cfg.cache != nil {
-		if n := cfg.cache.hits.Load(); n > 0 {
-			p.err("%d answers served from cache (TTL %s, %s for available).",
-				n, cfg.cache.ttl, cfg.cache.ttlAvail)
-		}
+	if d, s := cfg.cache.hitCount(cacheDomains), cfg.cache.hitCount(cacheServers); d+s > 0 {
+		p.err("From cache: %d verdicts (TTL %s, %s for available), %d server lookups.",
+			d, cfg.cache.ttl, cfg.cache.ttlAvail, s)
 	}
 }
 
@@ -578,7 +584,7 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 				// avail and taken verdicts expire on different clocks.
 				var cached result
 				if age, ok := cfg.cache.get(cacheDomains, domain, &cached); ok && age <= cfg.cache.ttlFor(cached.Status) {
-					cfg.cache.hits.Add(1)
+					cfg.cache.hit(cacheDomains)
 					if line := cached.format(domain, cfg.nreg); line != "" {
 						p.out("%s", line)
 					}
