@@ -63,6 +63,9 @@ const (
 	defaultPerHost = 2
 	defaultRetries = 2
 	defaultTTL     = 24 * time.Hour
+	// Available results are the actionable ones and the ones that go stale
+	// dangerously, so they expire far sooner than taken results.
+	defaultTTLAvail = time.Hour
 )
 
 // Mirrors the greps in tldhunt.sh: a response mentioning nameservers (or an
@@ -102,7 +105,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword> [-e <tld> | -E <tld-file>] [-x] [--update-tld]\n", prog)
 	fmt.Fprintf(os.Stderr, "Without -e or -E, the built-in TLD list (%d entries) is used.\n", len(embeddedList()))
 	if dir, err := xdgCacheDir(); err == nil {
-		fmt.Fprintf(os.Stderr, "Results are cached for %s in %s (-ttl 0 to disable).\n", defaultTTL, dir)
+		fmt.Fprintf(os.Stderr, "Results are cached in %s for %s (%s if available; -ttl 0 to disable).\n", dir, defaultTTL, defaultTTLAvail)
 	}
 	fmt.Fprintf(os.Stderr, "Example: %s -k linuxsec\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s -k linuxsec -E tlds.txt\n", prog)
@@ -125,6 +128,7 @@ func main() {
 		updateTLD bool
 		clear     bool
 		ttl       time.Duration
+		ttlAvail  time.Duration
 		cfg       config
 	)
 
@@ -144,6 +148,7 @@ func main() {
 	flag.IntVar(&cfg.retries, "retries", defaultRetries, "retries per lookup on a transient failure")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "per-whois-query timeout")
 	flag.DurationVar(&ttl, "ttl", defaultTTL, "cache lifetime for results; 0 disables the cache")
+	flag.DurationVar(&ttlAvail, "ttl-avail", defaultTTLAvail, "cache lifetime for available results; 0 to never cache them")
 	flag.BoolVar(&clear, "clear-cache", false, "delete the cache directory and exit")
 	flag.Usage = usage
 	flag.Parse()
@@ -198,7 +203,7 @@ func main() {
 	if cfg.retries < 0 {
 		cfg.retries = 0
 	}
-	cfg.cache = openCache(ttl)
+	cfg.cache = openCache(ttl, ttlAvail)
 
 	var tlds []string
 	switch {
@@ -331,9 +336,46 @@ const (
 
 type cache struct {
 	dir string
+	// ttl covers taken domains and server mappings, both of which are stable.
 	ttl time.Duration
-	// Cache hits are counted only to report a summary at the end of a run.
-	hits atomic.Int64
+	// ttlAvail covers available domains, which go stale in the direction that
+	// costs something: a name registered an hour after we cached it keeps
+	// reading "avail" for the rest of its lifetime. Kept short by default.
+	ttlAvail time.Duration
+	// Hits are counted per kind, only to report a summary at the end of a run.
+	// The two are tracked separately because they answer different questions:
+	// verdicts saved a registry query, servers saved an IANA lookup.
+	hits map[string]*atomic.Int64
+}
+
+func (c *cache) hit(kind string) {
+	if c == nil {
+		return
+	}
+	if n, ok := c.hits[kind]; ok {
+		n.Add(1)
+	}
+}
+
+func (c *cache) hitCount(kind string) int64 {
+	if c == nil {
+		return 0
+	}
+	if n, ok := c.hits[kind]; ok {
+		return n.Load()
+	}
+	return 0
+}
+
+// ttlFor returns the lifetime that applies to a cached verdict.
+func (c *cache) ttlFor(status string) time.Duration {
+	if c == nil {
+		return 0
+	}
+	if status == statusAvail {
+		return c.ttlAvail
+	}
+	return c.ttl
 }
 
 type cacheEntry struct {
@@ -365,10 +407,15 @@ func xdgCacheDir() (string, error) {
 }
 
 // openCache returns nil when caching is disabled or unavailable; every cache
-// method tolerates a nil receiver, so callers need no special case.
-func openCache(ttl time.Duration) *cache {
+// method tolerates a nil receiver, so callers need no special case. A ttl of
+// zero disables the cache outright; ttlAvail may be zero on its own to cache
+// only the taken verdicts.
+func openCache(ttl, ttlAvail time.Duration) *cache {
 	if ttl <= 0 {
 		return nil
+	}
+	if ttlAvail < 0 {
+		ttlAvail = 0
 	}
 	dir, err := xdgCacheDir()
 	if err != nil {
@@ -377,7 +424,7 @@ func openCache(ttl time.Duration) *cache {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil
 	}
-	return &cache{dir: dir, ttl: ttl}
+	return &cache{dir: dir, ttl: ttl, ttlAvail: ttlAvail}
 }
 
 func (c *cache) path(kind, key string) string {
@@ -386,24 +433,33 @@ func (c *cache) path(kind, key string) string {
 	return filepath.Join(c.dir, kind, name[:2], name+".json")
 }
 
-// get reports whether a live entry was found and decoded into out.
-func (c *cache) get(kind, key string, out any) bool {
+// get decodes a stored entry into out and reports its age. Freshness is left
+// to the caller: which TTL applies depends on what was decoded, so the entry
+// has to be read before it can be judged.
+func (c *cache) get(kind, key string, out any) (age time.Duration, ok bool) {
 	if c == nil {
-		return false
+		return 0, false
 	}
 	raw, err := os.ReadFile(c.path(kind, key))
 	if err != nil {
-		return false
+		return 0, false
 	}
 	var e cacheEntry
 	// Key is re-checked so a hash collision cannot serve the wrong answer.
 	if json.Unmarshal(raw, &e) != nil || e.Version != cacheVersion || e.Key != key {
-		return false
-	}
-	if time.Since(e.At) > c.ttl {
-		return false
+		return 0, false
 	}
 	if json.Unmarshal(e.Data, out) != nil {
+		return 0, false
+	}
+	return time.Since(e.At), true
+}
+
+// getFresh reads an entry and accepts it only if it is within ttl, counting a
+// hit when it is used.
+func (c *cache) getFresh(kind, key string, out any, ttl time.Duration) bool {
+	age, ok := c.get(kind, key, out)
+	if !ok || ttl <= 0 || age > ttl {
 		return false
 	}
 	c.hits.Add(1)
@@ -487,7 +543,8 @@ func hunt(keyword string, tlds []string, cfg config) {
 
 	if cfg.cache != nil {
 		if n := cfg.cache.hits.Load(); n > 0 {
-			p.err("%d answers served from cache (TTL %s).", n, cfg.cache.ttl)
+			p.err("%d answers served from cache (TTL %s, %s for available).",
+				n, cfg.cache.ttl, cfg.cache.ttlAvail)
 		}
 	}
 }
@@ -517,8 +574,11 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 					p.err("[%serror%s] %s - no TLD", orange, reset, domain)
 					continue
 				}
+				// The entry has to be decoded before its TTL is known, since
+				// avail and taken verdicts expire on different clocks.
 				var cached result
-				if cfg.cache.get(cacheDomains, domain, &cached) {
+				if age, ok := cfg.cache.get(cacheDomains, domain, &cached); ok && age <= cfg.cache.ttlFor(cached.Status) {
+					cfg.cache.hits.Add(1)
 					if line := cached.format(domain, cfg.nreg); line != "" {
 						p.out("%s", line)
 					}
@@ -590,30 +650,38 @@ func checkDomain(domain, server string, cfg config, p *printer) {
 		return
 	}
 	res := parseResult(body)
-	cfg.cache.put(cacheDomains, domain, res)
+	// A zero TTL for this verdict means don't store it at all.
+	if cfg.cache.ttlFor(res.Status) > 0 {
+		cfg.cache.put(cacheDomains, domain, res)
+	}
 	if line := res.format(domain, cfg.nreg); line != "" {
 		p.out("%s", line)
 	}
 }
 
+const (
+	statusAvail = "avail"
+	statusTaken = "taken"
+)
+
 // result is the decided verdict for a domain. The whois body itself is not
 // cached, only what was concluded from it; cacheVersion guards the shape.
 type result struct {
-	Status string   `json:"status"` // "avail" or "taken"
+	Status string   `json:"status"` // statusAvail or statusTaken
 	Expiry []string `json:"expiry,omitempty"`
 }
 
 func parseResult(body string) result {
 	if !registeredRe.MatchString(body) {
-		return result{Status: "avail"}
+		return result{Status: statusAvail}
 	}
-	return result{Status: "taken", Expiry: expiryDates(body)}
+	return result{Status: statusTaken, Expiry: expiryDates(body)}
 }
 
 // format renders the verdict. An empty string means "print nothing" (a taken
 // domain under -x).
 func (r result) format(domain string, nreg bool) string {
-	if r.Status == "avail" {
+	if r.Status == statusAvail {
 		return fmt.Sprintf("[%savail%s] %s", bGreen, reset, domain)
 	}
 	if nreg {
@@ -726,8 +794,9 @@ func (c *serverCache) get(tld string, cfg config) (string, error) {
 	c.mu.Unlock()
 
 	e.once.Do(func() {
+		// Server mappings change rarely, so they ride the long TTL.
 		var cached cachedServer
-		if c.disk.get(cacheServers, tld, &cached) {
+		if c.disk.getFresh(cacheServers, tld, &cached, c.disk.ttlFor(statusTaken)) {
 			e.server = cached.Server
 			if e.server == "" {
 				e.err = noWhoisServer(tld)
