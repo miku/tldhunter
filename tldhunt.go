@@ -8,6 +8,7 @@
 // self-contained.
 //
 //	go run tldhunt.go -k linuxsec              # built-in TLD list
+//	go run tldhunt.go -k delta.sh              # one domain, TLD detected
 //	go run tldhunt.go -k linuxsec -e .com
 //	go run tldhunt.go -k linuxsec -E tlds.txt  # override the built-in list
 //	go run tldhunt.go --update-tld             # refresh tlds.txt, then rebuild
@@ -102,12 +103,14 @@ func colorEnabled() bool {
 
 func usage() {
 	prog := os.Args[0]
-	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword> [-e <tld> | -E <tld-file>] [-x] [--update-tld]\n", prog)
-	fmt.Fprintf(os.Stderr, "Without -e or -E, the built-in TLD list (%d entries) is used.\n", len(embeddedList()))
+	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [--update-tld]\n", prog)
+	fmt.Fprintf(os.Stderr, "Without -e or -E, the built-in TLD list (%d entries) is used,\n", len(embeddedList()))
+	fmt.Fprintf(os.Stderr, "unless the keyword already ends in a known TLD, which checks just that domain.\n")
 	if dir, err := xdgCacheDir(); err == nil {
 		fmt.Fprintf(os.Stderr, "Results are cached in %s for %s (%s if available; -ttl 0 to disable).\n", dir, defaultTTL, defaultTTLAvail)
 	}
 	fmt.Fprintf(os.Stderr, "Example: %s -k linuxsec\n", prog)
+	fmt.Fprintf(os.Stderr, "       : %s -k delta.sh\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s -k linuxsec -E tlds.txt\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s --update-tld\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s --clear-cache\n", prog)
@@ -205,6 +208,14 @@ func main() {
 	}
 	cfg.cache = openCache(ttl, ttlAvail)
 
+	keyword = strings.ToLower(strings.TrimSpace(keyword))
+	// A leading, trailing, or doubled dot yields an invalid domain for every
+	// TLD, so reject it rather than firing a whole scan of nonsense queries.
+	if strings.HasPrefix(keyword, ".") || strings.HasSuffix(keyword, ".") || strings.Contains(keyword, "..") {
+		fmt.Fprintf(os.Stderr, "Invalid keyword %q: empty label.\n", keyword)
+		usage()
+	}
+
 	var tlds []string
 	switch {
 	case tld != "":
@@ -221,14 +232,46 @@ func main() {
 			fatalf("reading %s: %v", tldList, err)
 		}
 	default:
-		// Neither -e nor -E: fall back to the embedded list.
-		tlds = embeddedList()
+		// Neither -e nor -E. A keyword that already ends in a known TLD is a
+		// request to check that one domain, not to append every TLD to it.
+		if name, ext, ok := splitDomain(keyword); ok {
+			fmt.Fprintf(os.Stderr, "%s ends in a known TLD; checking that domain only (-E %s to scan all).\n", keyword, tldFile)
+			keyword, tlds = name, []string{ext}
+		} else {
+			tlds = embeddedList()
+		}
 	}
 	if len(tlds) == 0 {
 		fatalf("no TLDs to check.")
 	}
 
-	hunt(strings.ToLower(keyword), tlds, cfg)
+	hunt(keyword, tlds, cfg)
+}
+
+// knownTLDs indexes the embedded list for suffix lookups. Built once, lazily,
+// since only the no -e/-E path needs it.
+var knownTLDs = sync.OnceValue(func() map[string]bool {
+	set := make(map[string]bool)
+	for _, ext := range embeddedList() {
+		set[ext] = true
+	}
+	return set
+})
+
+// splitDomain reports whether keyword is already a complete domain name, and
+// if so splits it into the part before the TLD and the TLD itself. Only the
+// final label is tested, so "example.co.uk" splits on ".uk" and is checked as
+// one domain. A keyword whose last label is not a real TLD ("blog.mysite") is
+// left alone, and still gets scanned against every TLD.
+func splitDomain(keyword string) (name, ext string, ok bool) {
+	dot := strings.LastIndex(keyword, ".")
+	if dot <= 0 || dot == len(keyword)-1 {
+		return "", "", false
+	}
+	if ext = keyword[dot:]; !knownTLDs()[ext] {
+		return "", "", false
+	}
+	return keyword[:dot], ext, true
 }
 
 // normalizeTLD lowercases a TLD and gives it the leading dot that the entries
