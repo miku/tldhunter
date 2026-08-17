@@ -16,7 +16,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,9 +28,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -57,6 +62,7 @@ const (
 	// less than how many of those lookups land on any one server at once.
 	defaultPerHost = 2
 	defaultRetries = 2
+	defaultTTL     = 24 * time.Hour
 )
 
 // Mirrors the greps in tldhunt.sh: a response mentioning nameservers (or an
@@ -95,9 +101,13 @@ func usage() {
 	prog := os.Args[0]
 	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword> [-e <tld> | -E <tld-file>] [-x] [--update-tld]\n", prog)
 	fmt.Fprintf(os.Stderr, "Without -e or -E, the built-in TLD list (%d entries) is used.\n", len(embeddedList()))
+	if dir, err := xdgCacheDir(); err == nil {
+		fmt.Fprintf(os.Stderr, "Results are cached for %s in %s (-ttl 0 to disable).\n", defaultTTL, dir)
+	}
 	fmt.Fprintf(os.Stderr, "Example: %s -k linuxsec\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s -k linuxsec -E tlds.txt\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s --update-tld\n", prog)
+	fmt.Fprintf(os.Stderr, "       : %s --clear-cache\n", prog)
 	os.Exit(1)
 }
 
@@ -113,6 +123,8 @@ func main() {
 		tldList   string
 		nreg      bool
 		updateTLD bool
+		clear     bool
+		ttl       time.Duration
 		cfg       config
 	)
 
@@ -131,6 +143,8 @@ func main() {
 	flag.IntVar(&cfg.perHost, "perhost", defaultPerHost, "concurrent lookups per whois server")
 	flag.IntVar(&cfg.retries, "retries", defaultRetries, "retries per lookup on a transient failure")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "per-whois-query timeout")
+	flag.DurationVar(&ttl, "ttl", defaultTTL, "cache lifetime for results; 0 disables the cache")
+	flag.BoolVar(&clear, "clear-cache", false, "delete the cache directory and exit")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -142,6 +156,17 @@ func main() {
 	if flag.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "Unknown parameter passed: %s\n", flag.Arg(0))
 		usage()
+	}
+
+	if clear {
+		if updateTLD || keyword != "" || tld != "" || tldList != "" || nreg {
+			fmt.Fprintln(os.Stderr, "--clear-cache cannot be used with other flags.")
+			usage()
+		}
+		if err := clearCache(); err != nil {
+			fatalf("%v", err)
+		}
+		return
 	}
 
 	if updateTLD {
@@ -173,6 +198,7 @@ func main() {
 	if cfg.retries < 0 {
 		cfg.retries = 0
 	}
+	cfg.cache = openCache(ttl)
 
 	var tlds []string
 	switch {
@@ -270,6 +296,7 @@ type config struct {
 	retries int
 	timeout time.Duration
 	nreg    bool
+	cache   *cache // nil when caching is disabled
 }
 
 // printer serializes output so concurrent workers cannot interleave lines.
@@ -287,6 +314,160 @@ func (p *printer) err(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
+// The on-disk cache lives under the XDG base directory, one small JSON file
+// per entry, sharded two hex digits deep to keep directories small. Entries
+// are written atomically (temp file + rename) so concurrent runs cannot see a
+// half-written record.
+//
+// Two kinds are stored: "domains" holds a decided result for a full domain,
+// and "servers" holds a TLD's registry whois host. Only definitive answers are
+// cached — never a network failure, so a transient outage is not remembered as
+// fact. A missing or unreadable cache is never fatal; it just means a lookup.
+const (
+	cacheVersion = 1
+	cacheDomains = "domains"
+	cacheServers = "servers"
+)
+
+type cache struct {
+	dir string
+	ttl time.Duration
+	// Cache hits are counted only to report a summary at the end of a run.
+	hits atomic.Int64
+}
+
+type cacheEntry struct {
+	Version int             `json:"v"`
+	Key     string          `json:"key"`
+	At      time.Time       `json:"at"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// cachedServer records a TLD's whois host. An empty Server is a positive
+// finding: IANA publishes none and no whois.nic.<tld> answers.
+type cachedServer struct {
+	Server string `json:"server"`
+}
+
+// xdgCacheDir returns $XDG_CACHE_HOME/tldhunt, defaulting the base to
+// ~/.cache per the XDG Base Directory spec. This deliberately does not use
+// os.UserCacheDir, which resolves to ~/Library/Caches on macOS.
+func xdgCacheDir() (string, error) {
+	base := os.Getenv("XDG_CACHE_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "tldhunt"), nil
+}
+
+// openCache returns nil when caching is disabled or unavailable; every cache
+// method tolerates a nil receiver, so callers need no special case.
+func openCache(ttl time.Duration) *cache {
+	if ttl <= 0 {
+		return nil
+	}
+	dir, err := xdgCacheDir()
+	if err != nil {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil
+	}
+	return &cache{dir: dir, ttl: ttl}
+}
+
+func (c *cache) path(kind, key string) string {
+	sum := sha256.Sum256([]byte(kind + "\x00" + key))
+	name := hex.EncodeToString(sum[:])
+	return filepath.Join(c.dir, kind, name[:2], name+".json")
+}
+
+// get reports whether a live entry was found and decoded into out.
+func (c *cache) get(kind, key string, out any) bool {
+	if c == nil {
+		return false
+	}
+	raw, err := os.ReadFile(c.path(kind, key))
+	if err != nil {
+		return false
+	}
+	var e cacheEntry
+	// Key is re-checked so a hash collision cannot serve the wrong answer.
+	if json.Unmarshal(raw, &e) != nil || e.Version != cacheVersion || e.Key != key {
+		return false
+	}
+	if time.Since(e.At) > c.ttl {
+		return false
+	}
+	if json.Unmarshal(e.Data, out) != nil {
+		return false
+	}
+	c.hits.Add(1)
+	return true
+}
+
+func (c *cache) put(kind, key string, in any) {
+	if c == nil {
+		return
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		return
+	}
+	raw, err := json.Marshal(cacheEntry{
+		Version: cacheVersion,
+		Key:     key,
+		At:      time.Now(),
+		Data:    data,
+	})
+	if err != nil {
+		return
+	}
+
+	path := c.path(kind, key)
+	dir := filepath.Dir(path)
+	if os.MkdirAll(dir, 0o700) != nil {
+		return
+	}
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return
+	}
+	tmp := f.Name()
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return
+	}
+	if os.Rename(tmp, path) != nil {
+		os.Remove(tmp)
+	}
+}
+
+func clearCache() error {
+	dir, err := xdgCacheDir()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		fmt.Printf("No cache at %s.\n", dir)
+		return nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("removing %s: %w", dir, err)
+	}
+	fmt.Printf("Removed cache at %s.\n", dir)
+	return nil
+}
+
 // hunt runs in two phases. Phase one resolves every TLD to its registry whois
 // server; phase two groups the domains by that server and queries each group
 // with a per-server concurrency cap.
@@ -298,16 +479,24 @@ func (p *printer) err(format string, args ...any) {
 // on a single shared queue, where workers parked on a busy host would starve
 // the idle ones.
 func hunt(keyword string, tlds []string, cfg config) {
-	servers := &serverCache{entries: make(map[string]*serverEntry)}
+	servers := &serverCache{entries: make(map[string]*serverEntry), disk: cfg.cache}
 	p := &printer{}
 
 	byServer := resolveServers(keyword, tlds, servers, cfg, p)
 	queryAll(byServer, cfg, p)
+
+	if cfg.cache != nil {
+		if n := cfg.cache.hits.Load(); n > 0 {
+			p.err("%d answers served from cache (TTL %s).", n, cfg.cache.ttl)
+		}
+	}
 }
 
-// resolveServers maps each domain to its registry whois server, reporting the
-// TLDs that have none. whois.iana.org is a single well-provisioned host, so
-// this phase uses the full global concurrency rather than the per-host cap.
+// resolveServers serves any domain whose result is already cached, and maps
+// the rest to their registry whois server. Checking the domain cache here,
+// before the server lookup, means a fully cached run touches the network zero
+// times. whois.iana.org is a single well-provisioned host, so this phase uses
+// the full global concurrency rather than the per-host cap.
 func resolveServers(keyword string, tlds []string, servers *serverCache, cfg config, p *printer) map[string][]string {
 	if len(tlds) > 1 {
 		p.err("Resolving whois servers for %d TLDs...", len(tlds))
@@ -326,6 +515,13 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 				dot := strings.LastIndex(domain, ".")
 				if dot < 0 || dot == len(domain)-1 {
 					p.err("[%serror%s] %s - no TLD", orange, reset, domain)
+					continue
+				}
+				var cached result
+				if cfg.cache.get(cacheDomains, domain, &cached) {
+					if line := cached.format(domain, cfg.nreg); line != "" {
+						p.out("%s", line)
+					}
 					continue
 				}
 				server, err := servers.get(domain[dot+1:], cfg)
@@ -388,24 +584,44 @@ func queryAll(byServer map[string][]string, cfg config, p *printer) {
 func checkDomain(domain, server string, cfg config, p *printer) {
 	body, err := whoisQuery(server, domain, cfg)
 	if err != nil {
+		// Failures are never cached: a timeout today must not be replayed as
+		// a verdict for the rest of the TTL.
 		p.err("[%serror%s] %s - %v", orange, reset, domain, err)
 		return
 	}
-	p.out("%s", formatResult(domain, body, cfg.nreg))
+	res := parseResult(body)
+	cfg.cache.put(cacheDomains, domain, res)
+	if line := res.format(domain, cfg.nreg); line != "" {
+		p.out("%s", line)
+	}
 }
 
-// formatResult renders the verdict for a whois response. An empty string means
-// "print nothing" (a taken domain under -x).
-func formatResult(domain, body string, nreg bool) string {
+// result is the decided verdict for a domain. The whois body itself is not
+// cached, only what was concluded from it; cacheVersion guards the shape.
+type result struct {
+	Status string   `json:"status"` // "avail" or "taken"
+	Expiry []string `json:"expiry,omitempty"`
+}
+
+func parseResult(body string) result {
 	if !registeredRe.MatchString(body) {
+		return result{Status: "avail"}
+	}
+	return result{Status: "taken", Expiry: expiryDates(body)}
+}
+
+// format renders the verdict. An empty string means "print nothing" (a taken
+// domain under -x).
+func (r result) format(domain string, nreg bool) string {
+	if r.Status == "avail" {
 		return fmt.Sprintf("[%savail%s] %s", bGreen, reset, domain)
 	}
 	if nreg {
 		return ""
 	}
-	if dates := expiryDates(body); len(dates) > 0 {
+	if len(r.Expiry) > 0 {
 		return fmt.Sprintf("[%staken%s] %s - Exp Date: %s%s%s",
-			bRed, reset, domain, orange, strings.Join(dates, " "), reset)
+			bRed, reset, domain, orange, strings.Join(r.Expiry, " "), reset)
 	}
 	return fmt.Sprintf("[%staken%s] %s - No expiry date found", bRed, reset, domain)
 }
@@ -491,6 +707,7 @@ func whoisQueryOnce(server, query string, timeout time.Duration) (string, error)
 type serverCache struct {
 	mu      sync.Mutex
 	entries map[string]*serverEntry
+	disk    *cache
 }
 
 type serverEntry struct {
@@ -509,23 +726,38 @@ func (c *serverCache) get(tld string, cfg config) (string, error) {
 	c.mu.Unlock()
 
 	e.once.Do(func() {
+		var cached cachedServer
+		if c.disk.get(cacheServers, tld, &cached) {
+			e.server = cached.Server
+			if e.server == "" {
+				e.err = noWhoisServer(tld)
+			}
+			return
+		}
+
 		var body string
 		if body, e.err = whoisQuery(ianaServer, tld, cfg); e.err != nil {
+			// IANA itself was unreachable; that is not a fact about the TLD.
 			return
 		}
 		if m := ianaWhoisRe.FindStringSubmatch(body); m != nil {
 			e.server = m[1]
-			return
-		}
-		// IANA lists no server. Most such TLDs still answer on the
-		// conventional whois.nic.<tld> host, so try that if it resolves.
-		if fallback := "whois.nic." + tld; resolves(fallback, cfg.timeout) {
+		} else if fallback := "whois.nic." + tld; resolves(fallback, cfg.timeout) {
+			// IANA lists no server. Most such TLDs still answer on the
+			// conventional whois.nic.<tld> host, so try that if it resolves.
 			e.server = fallback
-			return
+		} else {
+			e.err = noWhoisServer(tld)
 		}
-		e.err = fmt.Errorf("no whois server published for .%s", tld)
+		// Either outcome is a definitive answer from IANA, so both are worth
+		// remembering; an empty server records "this TLD has none".
+		c.disk.put(cacheServers, tld, cachedServer{Server: e.server})
 	})
 	return e.server, e.err
+}
+
+func noWhoisServer(tld string) error {
+	return fmt.Errorf("no whois server published for .%s", tld)
 }
 
 func resolves(host string, timeout time.Duration) bool {
