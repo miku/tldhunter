@@ -38,12 +38,18 @@ import (
 	"time"
 )
 
-const banner = ` _____ _    ___  _  _          _
-|_   _| |  |   \| || |_  _ _ _| |_
-  | | | |__| |) | __ | || | ' \  _|
-  |_| |____|___/|_||_|\_,_|_||_\__|
-        Domain Availability Checker
+const banner = `▄▖▖ ▄ ▖▖▖▖▖ ▖▄▖
+▐ ▌ ▌▌▙▌▌▌▛▖▌▐
+▐ ▙▖▙▘▌▌▙▌▌▝▌▐
+Domain Availability Checker
 `
+
+// const banner = ` _____ _    ___  _  _          _
+// |_   _| |  |   \| || |_  _ _ _| |_
+//   | | | |__| |) | __ | || | ' \  _|
+//   |_| |____|___/|_||_|\_,_|_||_\__|
+//         Domain Availability Checker
+// `
 
 // embeddedTLDs is tlds.txt baked into the binary at build time, so the tool
 // runs standalone with no data file alongside it. It is the default TLD list;
@@ -69,10 +75,55 @@ const (
 	defaultTTLAvail = time.Hour
 )
 
-// Mirrors the greps in tldhunt.sh: a response mentioning nameservers (or an
-// active status) means the domain is registered.
+// Availability is decided by looking for an explicit "no such domain" reply
+// first, and only then for evidence of a registration. tldhunt.sh did the
+// reverse -- it grepped for nameservers and called anything else available --
+// which fails in the worst direction: a response it does not understand reads
+// as a free domain. DENIC is the case in point. A plain query for a
+// registered .de returns just "Domain: x.de / Status: connect", with no
+// nameservers and no "active", so the old rule reported it available.
+//
+// Patterns are matched per line, after stripping the comment markers that
+// registries use for their boilerplate.
 var (
-	registeredRe = regexp.MustCompile(`(?i)name server|nserver|nameservers|status: active`)
+	availableRes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)^no match`),
+		regexp.MustCompile(`(?i)^not found`),
+		regexp.MustCompile(`(?i)^no data found`),
+		regexp.MustCompile(`(?i)^no entries found`),
+		regexp.MustCompile(`(?i)^no object found`),
+		regexp.MustCompile(`(?i)^nothing found`),
+		regexp.MustCompile(`(?i)^domain (name )?not found`),
+		regexp.MustCompile(`(?i)^(the queried )?object does not exist`),
+		regexp.MustCompile(`(?i)^(domain |registration )?(status|state):\s*(free|available|no object found)`),
+		regexp.MustCompile(`(?i)^no information (available about domain name|was found matching)`),
+		regexp.MustCompile(`(?i)^available$`),
+		regexp.MustCompile(`(?i)\b(is )?(available|free) for registration\b`),
+		// "<domain> is free" as a whole line -- anchored at both ends so the
+		// phrase cannot match inside a terms-of-use paragraph.
+		regexp.MustCompile(`(?i)^\S+ is (free|available)$`),
+		// NIC Argentina answers in Spanish.
+		regexp.MustCompile(`(?i)^el dominio no se encuentra registrado`),
+	}
+	// A whois host may answer for a TLD it does not serve with a refusal
+	// rather than a verdict: Identity Digital's shared server says so for the
+	// many TLDs it moved to RDAP, and brand registries increasingly reply that
+	// the service is retired. None of these is an availability answer.
+	notServedRes = []*regexp.Regexp{
+		regexp.MustCompile(`(?im)^[%#\s]*tld is not supported`),
+		regexp.MustCompile(`(?im)^[%#\s]*this tld is not`),
+		regexp.MustCompile(`(?im)^[%#\s]*no whois server is known`),
+		regexp.MustCompile(`(?i)whois service has been retired`),
+		regexp.MustCompile(`(?i)but this server does not have`),
+	}
+	registeredRes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)^(name ?servers?|nserver):`),
+		regexp.MustCompile(`(?i)^(domain )?(status|state):\s*(connect|active|ok|registered|client|server)`),
+		regexp.MustCompile(`(?i)^(creation date|created|registered|registration (date|time)|domain record activated):`),
+		regexp.MustCompile(`(?i)^(registrar|sponsoring registrar|registry domain id|registrant):`),
+		regexp.MustCompile(`(?i)^(expiry date|expiration date|registry expiry date|paid-till):`),
+	}
+	commentRe    = regexp.MustCompile(`^[%#>\s]+`)
 	expiryLineRe = regexp.MustCompile(`(?i)expiry date|expiration date|expiration time`)
 	dateRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
 	// Anchored to the end of the line: some TLDs (.dev among them) publish an
@@ -415,10 +466,14 @@ func (c *cache) ttlFor(status string) time.Duration {
 	if c == nil {
 		return 0
 	}
-	if status == statusAvail {
+	switch status {
+	case statusAvail:
 		return c.ttlAvail
+	case statusTaken:
+		return c.ttl
+	default:
+		return 0 // never cache uncertainty
 	}
-	return c.ttl
 }
 
 type cacheEntry struct {
@@ -698,7 +753,18 @@ func checkDomain(domain, server string, cfg config, p *printer) {
 		p.err("[%serror%s] %s - %v", orange, reset, domain, err)
 		return
 	}
+	if matchesAny(notServedRes, body) {
+		p.err("[%serror%s] %s - %s does not serve this TLD (RDAP-only?)", orange, reset, domain, server)
+		return
+	}
 	res := parseResult(body)
+	if res.Status == statusUnknown {
+		// Report it instead of guessing. Reaching here means the registry
+		// answered in a shape neither pattern set recognises, which is a gap
+		// in the patterns worth seeing rather than a verdict.
+		p.err("[%sunknown%s] %s - unrecognised response from %s", orange, reset, domain, server)
+		return
+	}
 	// A zero TTL for this verdict means don't store it at all.
 	if cfg.cache.ttlFor(res.Status) > 0 {
 		cfg.cache.put(cacheDomains, domain, res)
@@ -711,6 +777,9 @@ func checkDomain(domain, server string, cfg config, p *printer) {
 const (
 	statusAvail = "avail"
 	statusTaken = "taken"
+	// statusUnknown is a response that matched neither set of patterns. It is
+	// reported rather than guessed at, and never cached.
+	statusUnknown = "unknown"
 )
 
 // result is the decided verdict for a domain. The whois body itself is not
@@ -720,11 +789,36 @@ type result struct {
 	Expiry []string `json:"expiry,omitempty"`
 }
 
+// parseResult classifies a whois response. The "not found" reply is checked
+// first because it is the unambiguous one; registries answer it in a handful
+// of well-known phrasings, whereas a registered domain's record varies wildly.
 func parseResult(body string) result {
-	if !registeredRe.MatchString(body) {
-		return result{Status: statusAvail}
+	var registered bool
+	for _, line := range strings.Split(body, "\n") {
+		line = commentRe.ReplaceAllString(strings.TrimSpace(line), "")
+		if line == "" {
+			continue
+		}
+		if matchesAny(availableRes, line) {
+			return result{Status: statusAvail}
+		}
+		if !registered && matchesAny(registeredRes, line) {
+			registered = true
+		}
 	}
-	return result{Status: statusTaken, Expiry: expiryDates(body)}
+	if registered {
+		return result{Status: statusTaken, Expiry: expiryDates(body)}
+	}
+	return result{Status: statusUnknown}
+}
+
+func matchesAny(res []*regexp.Regexp, line string) bool {
+	for _, re := range res {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // format renders the verdict. An empty string means "print nothing" (a taken
