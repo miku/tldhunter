@@ -44,13 +44,6 @@ const banner = `▄▖▖ ▄ ▖▖▖▖▖ ▖▄▖
 Domain Availability Checker
 `
 
-// const banner = ` _____ _    ___  _  _          _
-// |_   _| |  |   \| || |_  _ _ _| |_
-//   | | | |__| |) | __ | || | ' \  _|
-//   |_| |____|___/|_||_|\_,_|_||_\__|
-//         Domain Availability Checker
-// `
-
 // embeddedTLDs is tlds.txt baked into the binary at build time, so the tool
 // runs standalone with no data file alongside it. It is the default TLD list;
 // -E overrides it and --update-tld refreshes the on-disk copy for the next
