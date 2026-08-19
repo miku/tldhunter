@@ -4,6 +4,11 @@
 // and curl(1) it speaks the WHOIS protocol (RFC 3912) over TCP/43 itself,
 // resolving each TLD's registry server through whois.iana.org.
 //
+// A growing number of registries publish no whois server at all -- .dev and the
+// rest of Google's are the standard example -- and answer only over RDAP. Those
+// TLDs fall back to RDAP (RFC 7480/9082), with endpoints taken from IANA's
+// bootstrap registry (RFC 9224).
+//
 // tlds.txt is embedded at build time and used by default, so the binary is
 // self-contained.
 //
@@ -31,6 +36,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,11 +59,25 @@ Domain Availability Checker
 var embeddedTLDs string
 
 const (
-	tldURL      = "https://data.iana.org/TLD/tlds-alpha-by-domain.txt"
-	tldFile     = "tlds.txt"
-	ianaServer  = "whois.iana.org"
-	whoisPort   = "43"
-	defaultJobs = 30
+	tldURL     = "https://data.iana.org/TLD/tlds-alpha-by-domain.txt"
+	tldFile    = "tlds.txt"
+	ianaServer = "whois.iana.org"
+	whoisPort  = "43"
+	// rdapBootstrapURL is IANA's RFC 9224 registry mapping TLDs to RDAP base
+	// URLs. It is the machine-readable form of the "RDAP Server" line on each
+	// root-zone database page, and covers roughly 1200 of the ~1440 TLDs --
+	// nearly all gTLDs. The gaps are mostly ccTLDs, which have whois.
+	rdapBootstrapURL = "https://data.iana.org/rdap/dns.json"
+	userAgent        = "tldhunt (+https://github.com/yuyudhn/TLDHunt)"
+	// rdapMaxBody caps how much of an RDAP response is decoded. Records run to
+	// a few KB; anything far larger is a misbehaving server, not a domain.
+	rdapMaxBody = 1 << 20
+	// The bootstrap registry is one document covering every TLD, so it gets a
+	// far looser cap: it is ~70KB today and only grows.
+	bootstrapMaxBody = 16 << 20
+	// maxRetryAfter bounds how long a Retry-After header can park a lookup.
+	maxRetryAfter = 30 * time.Second
+	defaultJobs   = 30
 	// Registries throttle per source address, so the global cap matters far
 	// less than how many of those lookups land on any one server at once.
 	defaultPerHost = 2
@@ -411,14 +431,21 @@ func (p *printer) err(format string, args ...any) {
 // are written atomically (temp file + rename) so concurrent runs cannot see a
 // half-written record.
 //
-// Two kinds are stored: "domains" holds a decided result for a full domain,
-// and "servers" holds a TLD's registry whois host. Only definitive answers are
-// cached — never a network failure, so a transient outage is not remembered as
-// fact. A missing or unreadable cache is never fatal; it just means a lookup.
+// Three kinds are stored: "domains" holds a decided result for a full domain,
+// "servers" holds a TLD's registry endpoint, and "rdap" holds the flattened
+// bootstrap registry. Only definitive answers are cached — never a network
+// failure, so a transient outage is not remembered as fact. A missing or
+// unreadable cache is never fatal; it just means a lookup.
 const (
-	cacheVersion = 1
+	// Version 2 added RDAP. Bumping it discards v1 entries, which is the point:
+	// a v1 "no whois server" record was written before RDAP was ever consulted,
+	// so replaying it would keep .dev and friends erroring for a whole TTL.
+	cacheVersion = 2
 	cacheDomains = "domains"
 	cacheServers = "servers"
+	cacheRDAP    = "rdap"
+	// The bootstrap registry is a single document, so it needs only one key.
+	rdapBootstrapKey = "dns"
 )
 
 type cache struct {
@@ -476,10 +503,17 @@ type cacheEntry struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-// cachedServer records a TLD's whois host. An empty Server is a positive
-// finding: IANA publishes none and no whois.nic.<tld> answers.
+// cachedServer records where a TLD's verdicts come from. An empty Server is a
+// positive finding: neither whois nor RDAP serves this TLD.
 type cachedServer struct {
 	Server string `json:"server"`
+	RDAP   bool   `json:"rdap,omitempty"`
+}
+
+// cachedBootstrap is the RDAP bootstrap registry flattened to TLD -> base URL.
+// Storing the derived map rather than the document keeps re-reads cheap.
+type cachedBootstrap struct {
+	Servers map[string]string `json:"servers"`
 }
 
 // xdgCacheDir returns $XDG_CACHE_HOME/tldhunt, defaulting the base to
@@ -522,6 +556,7 @@ func openCache(ttl, ttlAvail time.Duration) *cache {
 		hits: map[string]*atomic.Int64{
 			cacheDomains: new(atomic.Int64),
 			cacheServers: new(atomic.Int64),
+			cacheRDAP:    new(atomic.Int64),
 		},
 	}
 }
@@ -623,9 +658,9 @@ func clearCache() error {
 	return nil
 }
 
-// hunt runs in two phases. Phase one resolves every TLD to its registry whois
-// server; phase two groups the domains by that server and queries each group
-// with a per-server concurrency cap.
+// hunt runs in two phases. Phase one resolves every TLD to its registry
+// endpoint; phase two groups the domains by that endpoint and queries each
+// group with a per-server concurrency cap.
 //
 // The grouping is the point: hundreds of gTLDs share a single whois host (all
 // of Identity Digital's sit behind one IP), so a purely global worker pool
@@ -633,12 +668,27 @@ func clearCache() error {
 // first also avoids the head-of-line blocking a per-host semaphore would cause
 // on a single shared queue, where workers parked on a busy host would starve
 // the idle ones.
+//
+// Phase two can discover that a whois server is the wrong place to ask, and
+// hand those domains to RDAP. That regrouping matters for the same reason: the
+// concentration is even higher on the RDAP side, where a single Identity
+// Digital endpoint serves 451 of the TLDs in the list. So the handed-off
+// domains go through a second round rather than being queried in place, which
+// would aim every whois group at that one endpoint at once.
 func hunt(keyword string, tlds []string, cfg config) {
 	servers := &serverCache{entries: make(map[string]*serverEntry), disk: cfg.cache}
 	p := &printer{}
 
 	byServer := resolveServers(keyword, tlds, servers, cfg, p)
-	queryAll(byServer, cfg, p)
+	if n := len(byServer); n > 1 {
+		p.err("Querying %d registries (max %d concurrent per server)...", n, cfg.perHost)
+	}
+	// One extra round settles everything: only whois hands off, and it hands
+	// off only to RDAP, so the second round's own retries are always empty.
+	if retry := queryAll(byServer, servers, cfg, p); len(retry) > 0 {
+		p.err("Falling back to RDAP for %d domains across %d endpoints...", countDomains(retry), len(retry))
+		queryAll(retry, servers, cfg, p)
+	}
 
 	if d, s := cfg.cache.hitCount(cacheDomains), cfg.cache.hitCount(cacheServers); d+s > 0 {
 		p.err("From cache: %d verdicts (TTL %s, %s for available), %d server lookups.",
@@ -651,12 +701,12 @@ func hunt(keyword string, tlds []string, cfg config) {
 // before the server lookup, means a fully cached run touches the network zero
 // times. whois.iana.org is a single well-provisioned host, so this phase uses
 // the full global concurrency rather than the per-host cap.
-func resolveServers(keyword string, tlds []string, servers *serverCache, cfg config, p *printer) map[string][]string {
+func resolveServers(keyword string, tlds []string, servers *serverCache, cfg config, p *printer) map[endpoint][]string {
 	if len(tlds) > 1 {
 		p.err("Resolving whois servers for %d TLDs...", len(tlds))
 	}
 
-	byServer := make(map[string][]string)
+	byServer := make(map[endpoint][]string)
 	var mu sync.Mutex
 
 	work := make(chan string)
@@ -681,7 +731,7 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 					}
 					continue
 				}
-				server, err := servers.get(domain[dot+1:], cfg)
+				ep, err := servers.get(domain[dot+1:], cfg)
 				if err != nil {
 					// The shell version treats a failed lookup as
 					// "available", which is a false positive; report it
@@ -690,7 +740,7 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 					continue
 				}
 				mu.Lock()
-				byServer[server] = append(byServer[server], domain)
+				byServer[ep] = append(byServer[ep], domain)
 				mu.Unlock()
 			}
 		}()
@@ -706,17 +756,18 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 
 // queryAll fans out over the servers, each group limited to cfg.perHost
 // concurrent queries, with cfg.jobs bounding the total in flight.
-func queryAll(byServer map[string][]string, cfg config, p *printer) {
-	if n := len(byServer); n > 1 {
-		p.err("Querying %d registries (max %d concurrent per server)...", n, cfg.perHost)
-	}
-
+// queryAll returns the domains whose endpoint turned out to be the wrong one,
+// regrouped under the RDAP endpoint that should have them.
+func queryAll(byServer map[endpoint][]string, servers *serverCache, cfg config, p *printer) map[endpoint][]string {
 	global := make(chan struct{}, cfg.jobs)
 	var wg sync.WaitGroup
 
+	retry := make(map[endpoint][]string)
+	var rmu sync.Mutex
+
 	for server, domains := range byServer {
 		wg.Add(1)
-		go func(server string, domains []string) {
+		go func(ep endpoint, domains []string) {
 			defer wg.Done()
 			// Both semaphores are always taken in this order and released
 			// together, so the fixed ordering rules out deadlock.
@@ -729,34 +780,58 @@ func queryAll(byServer map[string][]string, cfg config, p *printer) {
 				go func(domain string) {
 					defer group.Done()
 					defer func() { <-global; <-host }()
-					checkDomain(domain, server, cfg, p)
+					alt, again := checkDomain(domain, ep, servers, cfg, p)
+					if !again {
+						return
+					}
+					rmu.Lock()
+					retry[alt] = append(retry[alt], domain)
+					rmu.Unlock()
 				}(domain)
 			}
 			group.Wait()
 		}(server, domains)
 	}
 	wg.Wait()
+
+	return retry
 }
 
-func checkDomain(domain, server string, cfg config, p *printer) {
-	body, err := whoisQuery(server, domain, cfg)
+func countDomains(byServer map[endpoint][]string) int {
+	n := 0
+	for _, domains := range byServer {
+		n += len(domains)
+	}
+	return n
+}
+
+// checkDomain queries one domain and prints the outcome — unless ep turns out
+// not to be the server for this TLD, in which case it returns that TLD's RDAP
+// endpoint for the caller to requeue rather than querying it here.
+func checkDomain(domain string, ep endpoint, servers *serverCache, cfg config, p *printer) (endpoint, bool) {
+	res, wrong, err := query(domain, ep, cfg)
+	if wrong {
+		tld := tldOf(domain)
+		if base := servers.rdapBase(tld, cfg); base != "" {
+			servers.learnRDAP(tld, base)
+			return endpoint{addr: base, rdap: true}, true
+		}
+		if err == nil {
+			err = fmt.Errorf("%s does not serve this TLD, which has no RDAP endpoint either", ep.addr)
+		}
+	}
 	if err != nil {
 		// Failures are never cached: a timeout today must not be replayed as
 		// a verdict for the rest of the TTL.
 		p.err("[%serror%s] %s - %v", orange, reset, domain, err)
-		return
+		return endpoint{}, false
 	}
-	if matchesAny(notServedRes, body) {
-		p.err("[%serror%s] %s - %s does not serve this TLD (RDAP-only?)", orange, reset, domain, server)
-		return
-	}
-	res := parseResult(body)
 	if res.Status == statusUnknown {
 		// Report it instead of guessing. Reaching here means the registry
 		// answered in a shape neither pattern set recognises, which is a gap
 		// in the patterns worth seeing rather than a verdict.
-		p.err("[%sunknown%s] %s - unrecognised response from %s", orange, reset, domain, server)
-		return
+		p.err("[%sunknown%s] %s - unrecognised response from %s", orange, reset, domain, ep.addr)
+		return endpoint{}, false
 	}
 	// A zero TTL for this verdict means don't store it at all.
 	if cfg.cache.ttlFor(res.Status) > 0 {
@@ -765,6 +840,42 @@ func checkDomain(domain, server string, cfg config, p *printer) {
 	if line := res.format(domain, cfg.nreg); line != "" {
 		p.out("%s", line)
 	}
+	return endpoint{}, false
+}
+
+// query asks one endpoint about one domain. A true wrong return means the
+// endpoint is not the one serving this TLD, so the caller should look for an
+// RDAP endpoint instead. A TLD that IANA still lists a whois server for can
+// nonetheless be RDAP-only, in two ways:
+//
+//   - The host answers on port 43 only to disown the TLD. Identity Digital's
+//     shared server does this for everything it moved to RDAP.
+//   - Port 43 is gone entirely -- connection refused, or a whois.nic.<tld>
+//     that no longer resolves -- while the registry answers fine over RDAP.
+//
+// The second is told apart from throttling by retryable: a refusal or NXDOMAIN
+// is the registry stating there is no whois service here, whereas a reset or
+// timeout is congestion, already retried, and worth reporting as the failure it
+// is rather than routing around.
+func query(domain string, ep endpoint, cfg config) (res result, wrong bool, err error) {
+	if ep.rdap {
+		res, err = rdapQuery(ep.addr, domain, cfg)
+		return res, false, err
+	}
+	body, err := whoisQuery(ep.addr, domain, cfg)
+	if err != nil {
+		return result{}, !retryable(err), err
+	}
+	if matchesAny(notServedRes, body) {
+		return result{}, true, nil
+	}
+	return parseResult(body), false, nil
+}
+
+// tldOf returns a domain's final label. Callers reach it only with names that
+// resolveServers already split on a dot, so no validation is needed.
+func tldOf(domain string) string {
+	return domain[strings.LastIndex(domain, ".")+1:]
 }
 
 const (
@@ -906,21 +1017,35 @@ func whoisQueryOnce(server, query string, timeout time.Duration) (string, error)
 	return strings.ReplaceAll(string(body), "\r\n", "\n"), nil
 }
 
-// serverCache maps a TLD to its registry whois server, asking whois.iana.org
-// at most once per TLD even when many goroutines want the same answer.
+// endpoint is where a TLD's verdicts come from: a whois host queried on port
+// 43, or an RDAP base URL queried over HTTPS. It is comparable, so it doubles
+// as the grouping key that keeps concurrent queries off any one server.
+type endpoint struct {
+	addr string // whois hostname, or RDAP base URL
+	rdap bool
+}
+
+// serverCache maps a TLD to its registry endpoint, asking whois.iana.org at
+// most once per TLD even when many goroutines want the same answer.
 type serverCache struct {
 	mu      sync.Mutex
 	entries map[string]*serverEntry
 	disk    *cache
+
+	// The RDAP bootstrap registry is fetched at most once per run, and only if
+	// some TLD actually turns out to need it. A nil map means "no RDAP this
+	// run", which is a normal outcome when the fetch fails.
+	bootOnce sync.Once
+	boot     map[string]string
 }
 
 type serverEntry struct {
-	once   sync.Once
-	server string
-	err    error
+	once sync.Once
+	ep   endpoint
+	err  error
 }
 
-func (c *serverCache) get(tld string, cfg config) (string, error) {
+func (c *serverCache) get(tld string, cfg config) (endpoint, error) {
 	c.mu.Lock()
 	e, ok := c.entries[tld]
 	if !ok {
@@ -930,12 +1055,12 @@ func (c *serverCache) get(tld string, cfg config) (string, error) {
 	c.mu.Unlock()
 
 	e.once.Do(func() {
-		// Server mappings change rarely, so they ride the long TTL.
+		// Endpoint mappings change rarely, so they ride the long TTL.
 		var cached cachedServer
 		if c.disk.getFresh(cacheServers, tld, &cached, c.disk.ttlFor(statusTaken)) {
-			e.server = cached.Server
-			if e.server == "" {
-				e.err = noWhoisServer(tld)
+			e.ep = endpoint{addr: cached.Server, rdap: cached.RDAP}
+			if e.ep.addr == "" {
+				e.err = noServer(tld)
 			}
 			return
 		}
@@ -945,24 +1070,52 @@ func (c *serverCache) get(tld string, cfg config) (string, error) {
 			// IANA itself was unreachable; that is not a fact about the TLD.
 			return
 		}
-		if m := ianaWhoisRe.FindStringSubmatch(body); m != nil {
-			e.server = m[1]
-		} else if fallback := "whois.nic." + tld; resolves(fallback, cfg.timeout) {
-			// IANA lists no server. Most such TLDs still answer on the
+		switch m := ianaWhoisRe.FindStringSubmatch(body); {
+		case m != nil:
+			e.ep = endpoint{addr: m[1]}
+		case resolves("whois.nic."+tld, cfg.timeout):
+			// IANA lists no server. Many such TLDs still answer on the
 			// conventional whois.nic.<tld> host, so try that if it resolves.
-			e.server = fallback
-		} else {
-			e.err = noWhoisServer(tld)
+			e.ep = endpoint{addr: "whois.nic." + tld}
+		default:
+			// No whois at all. RDAP is the modern answer and, unlike the guess
+			// above, it is published rather than inferred -- but it is tried
+			// last so that a TLD with a working port 43 keeps using it.
+			if base := c.rdapBase(tld, cfg); base != "" {
+				e.ep = endpoint{addr: base, rdap: true}
+			} else {
+				e.err = noServer(tld)
+			}
 		}
-		// Either outcome is a definitive answer from IANA, so both are worth
-		// remembering; an empty server records "this TLD has none".
-		c.disk.put(cacheServers, tld, cachedServer{Server: e.server})
+		// Every outcome here is a definitive answer, so all are worth
+		// remembering; an empty server records "this TLD has neither".
+		c.disk.put(cacheServers, tld, cachedServer{Server: e.ep.addr, RDAP: e.ep.rdap})
 	})
-	return e.server, e.err
+	return e.ep, e.err
 }
 
-func noWhoisServer(tld string) error {
-	return fmt.Errorf("no whois server published for .%s", tld)
+// rdapBase returns the RDAP base URL for a TLD, or "" if it has none, loading
+// the bootstrap registry on first use.
+func (c *serverCache) rdapBase(tld string, cfg config) string {
+	c.bootOnce.Do(func() { c.boot = loadBootstrap(c.disk, cfg) })
+	return c.boot[tld]
+}
+
+// learnRDAP records that a TLD's published whois server does not actually
+// serve it, so the next run goes straight to RDAP rather than rediscovering
+// this one dead query at a time. Only the disk cache is updated: this run has
+// already handed the affected domains to the RDAP round, and the in-memory
+// entry is published to other goroutines that would race on a write.
+//
+// Worth doing even though the entry is a downgrade of a published record: the
+// TTL bounds it to a day, and the failure mode if a registry restores port 43
+// early is using RDAP for the rest of that day, which works.
+func (c *serverCache) learnRDAP(tld, base string) {
+	c.disk.put(cacheServers, tld, cachedServer{Server: base, RDAP: true})
+}
+
+func noServer(tld string) error {
+	return fmt.Errorf("no whois or RDAP server published for .%s", tld)
 }
 
 func resolves(host string, timeout time.Duration) bool {
@@ -970,4 +1123,255 @@ func resolves(host string, timeout time.Duration) bool {
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
 	return err == nil && len(addrs) > 0
+}
+
+// httpClient is shared so the many TLDs behind one RDAP service reuse
+// connections. Per-request deadlines come from the context rather than
+// Client.Timeout, which would apply to the whole client.
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
+// loadBootstrap returns the bootstrap registry flattened to TLD -> base URL. A
+// failure is deliberately not fatal and not cached: it just means no RDAP
+// fallback for this run, leaving the affected TLDs reported as unserved.
+func loadBootstrap(disk *cache, cfg config) map[string]string {
+	var cached cachedBootstrap
+	if disk.getFresh(cacheRDAP, rdapBootstrapKey, &cached, disk.ttlFor(statusTaken)) {
+		return cached.Servers
+	}
+	servers, err := fetchBootstrap(cfg.timeout)
+	if err != nil {
+		return nil
+	}
+	disk.put(cacheRDAP, rdapBootstrapKey, cachedBootstrap{Servers: servers})
+	return servers
+}
+
+func fetchBootstrap(timeout time.Duration) (map[string]string, error) {
+	body, err := httpGet(rdapBootstrapURL, "application/json", timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+
+	// Each service entry is a pair of arrays: the TLDs it covers, then the base
+	// URLs serving them. Decoding into a fixed-size array tolerates a registry
+	// that grows a third element without breaking the parse.
+	var doc struct {
+		Services [][2][]string `json:"services"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, bootstrapMaxBody)).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", rdapBootstrapURL, err)
+	}
+	servers := make(map[string]string, 1500)
+	for _, svc := range doc.Services {
+		base := preferHTTPS(svc[1])
+		if base == "" {
+			continue
+		}
+		for _, tld := range svc[0] {
+			servers[strings.ToLower(tld)] = base
+		}
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("%s listed no RDAP servers", rdapBootstrapURL)
+	}
+	return servers, nil
+}
+
+// preferHTTPS picks the https base URL when a service publishes both.
+func preferHTTPS(urls []string) string {
+	for _, u := range urls {
+		if strings.HasPrefix(u, "https://") {
+			return u
+		}
+	}
+	if len(urls) > 0 {
+		return urls[0]
+	}
+	return ""
+}
+
+// rdapDomain is the slice of an RDAP domain object that a verdict needs.
+type rdapDomain struct {
+	ObjectClassName string `json:"objectClassName"`
+	LDHName         string `json:"ldhName"`
+	// Present when the server returns an error document; RFC 7480 pairs it
+	// with a matching HTTP status, but not every implementation does.
+	ErrorCode int `json:"errorCode"`
+	Events    []struct {
+		Action string `json:"eventAction"`
+		Date   string `json:"eventDate"`
+	} `json:"events"`
+}
+
+// expiry pulls the date out of the expiration event, trimmed to YYYY-MM-DD so
+// RDAP and whois verdicts print and cache identically. RDAP timestamps are
+// RFC 3339, so the date is always the leading component.
+func (d rdapDomain) expiry() []string {
+	var dates []string
+	seen := make(map[string]bool)
+	for _, ev := range d.Events {
+		if !strings.EqualFold(ev.Action, "expiration") {
+			continue
+		}
+		if s := dateRe.FindString(ev.Date); s != "" && !seen[s] {
+			seen[s] = true
+			dates = append(dates, s)
+		}
+	}
+	return dates
+}
+
+// rdapStatusError is an HTTP status that is neither a verdict nor a transport
+// failure, kept as a type so retryability and delay can be read off the reply.
+type rdapStatusError struct {
+	code int
+	// after carries a Retry-After header, if the server sent one.
+	after time.Duration
+}
+
+func (e rdapStatusError) Error() string {
+	return fmt.Sprintf("RDAP server returned %d %s", e.code, http.StatusText(e.code))
+}
+
+// rdapQuery performs one RDAP domain lookup, retrying transient failures the
+// way whoisQuery does. Unlike whois there is nothing to pattern-match: RFC 7480
+// puts the answer in the status code, where 404 means the name is unregistered.
+func rdapQuery(base, domain string, cfg config) (result, error) {
+	url := strings.TrimSuffix(base, "/") + "/domain/" + domain
+	var err error
+	for attempt := 0; ; attempt++ {
+		var res result
+		if res, err = rdapQueryOnce(url, cfg.timeout); err == nil {
+			return res, nil
+		}
+		if attempt >= cfg.retries || !retryableRDAP(err) {
+			return result{}, err
+		}
+		time.Sleep(rdapBackoff(err, attempt))
+	}
+}
+
+// retryableRDAP treats throttling and server faults as worth another attempt.
+//
+// 403 counts as throttling here, against its usual meaning. Identity Digital's
+// endpoint -- which serves 451 of the TLDs in the list, so it takes by far the
+// most load -- answers a rate-limited query with 403 rather than 429, and the
+// same query succeeds once the burst passes. A genuine refusal costs only the
+// remaining retries.
+func retryableRDAP(err error) bool {
+	var se rdapStatusError
+	if errors.As(err, &se) {
+		switch se.code {
+		case http.StatusTooManyRequests, http.StatusForbidden:
+			return true
+		}
+		return se.code >= 500
+	}
+	return retryable(err)
+}
+
+// rdapBackoff prefers the server's own Retry-After over a guess, capped so one
+// unreasonable header cannot stall a scan.
+func rdapBackoff(err error, attempt int) time.Duration {
+	var se rdapStatusError
+	if errors.As(err, &se) && se.after > 0 {
+		return min(se.after, maxRetryAfter)
+	}
+	return backoff(attempt)
+}
+
+// retryAfter parses the header in both forms RFC 9110 allows: a delay in
+// seconds, or an absolute date. An unparseable value yields 0, meaning "fall
+// back to the usual backoff".
+func retryAfter(h http.Header) time.Duration {
+	v := h.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func rdapQueryOnce(url string, timeout time.Duration) (result, error) {
+	body, err := httpGet(url, "application/rdap+json", timeout)
+	if err != nil {
+		var se rdapStatusError
+		// A 404 is the whole point of the protocol here, not a failure.
+		if errors.As(err, &se) && se.code == http.StatusNotFound {
+			return result{Status: statusAvail}, nil
+		}
+		return result{}, err
+	}
+	defer body.Close()
+
+	var d rdapDomain
+	if err := json.NewDecoder(io.LimitReader(body, rdapMaxBody)).Decode(&d); err != nil {
+		return result{}, fmt.Errorf("decoding RDAP response: %w", err)
+	}
+	// A 200 carrying an error document, or one carrying no domain at all, is
+	// not an answer; let the caller report it rather than guess a verdict.
+	if d.ErrorCode != 0 || (d.LDHName == "" && !strings.EqualFold(d.ObjectClassName, "domain")) {
+		return result{Status: statusUnknown}, nil
+	}
+	return result{Status: statusTaken, Expiry: d.expiry()}, nil
+}
+
+// httpGet issues a GET with a per-request deadline and returns the body for a
+// 2xx, or an rdapStatusError otherwise. The caller closes the body.
+func httpGet(url, accept string, timeout time.Duration) (io.ReadCloser, error) {
+	// The context outlives this call: cancelling it on return would kill the
+	// body the caller is about to read, so closing the body is what releases it.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		// Drain before closing so the connection can be reused for the next
+		// TLD on this host; error bodies are small.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, rdapMaxBody))
+		resp.Body.Close()
+		cancel()
+		return nil, rdapStatusError{code: resp.StatusCode, after: retryAfter(resp.Header)}
+	}
+	return &cancelReader{ReadCloser: resp.Body, cancel: cancel}, nil
+}
+
+// cancelReader releases a request's context once its body is closed.
+type cancelReader struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReader) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
