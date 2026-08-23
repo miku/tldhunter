@@ -1,4 +1,4 @@
-// Command tldhunt checks whether a keyword is available across a set of TLDs.
+// Command tldhunter checks whether a keyword is available across a set of TLDs.
 //
 // It is a pure-stdlib port of tldhunt.sh. Rather than shelling out to whois(1)
 // and curl(1) it speaks the WHOIS protocol (RFC 3912) over TCP/43 itself,
@@ -12,11 +12,11 @@
 // tlds.txt is embedded at build time and used by default, so the binary is
 // self-contained.
 //
-//	go run tldhunt.go -k linuxsec              # built-in TLD list
-//	go run tldhunt.go -k delta.sh              # one domain, TLD detected
-//	go run tldhunt.go -k linuxsec -e .com
-//	go run tldhunt.go -k linuxsec -E tlds.txt  # override the built-in list
-//	go run tldhunt.go --update-tld             # refresh tlds.txt, then rebuild
+//	go run tldhunter.go -k linuxsec              # built-in TLD list
+//	go run tldhunter.go -k delta.sh              # one domain, TLD detected
+//	go run tldhunter.go -k linuxsec -e .com
+//	go run tldhunter.go -k linuxsec -E tlds.txt  # override the built-in list
+//	go run tldhunter.go --update-tld             # refresh tlds.txt, then rebuild
 package main
 
 import (
@@ -68,7 +68,7 @@ const (
 	// root-zone database page, and covers roughly 1200 of the ~1440 TLDs --
 	// nearly all gTLDs. The gaps are mostly ccTLDs, which have whois.
 	rdapBootstrapURL = "https://data.iana.org/rdap/dns.json"
-	userAgent        = "tldhunt (+https://github.com/yuyudhn/TLDHunt)"
+	userAgent        = "tldhunter (+https://github.com/miku/tldhunter)"
 	// rdapMaxBody caps how much of an RDAP response is decoded. Records run to
 	// a few KB; anything far larger is a misbehaving server, not a domain.
 	rdapMaxBody = 1 << 20
