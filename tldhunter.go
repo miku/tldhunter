@@ -109,17 +109,29 @@ var (
 		regexp.MustCompile(`(?i)^no entries found`),
 		regexp.MustCompile(`(?i)^no object found`),
 		regexp.MustCompile(`(?i)^nothing found`),
-		regexp.MustCompile(`(?i)^domain (name )?not found`),
+		// IIS (.se) puts the name between the key and the verdict:
+		// `domain "example.se" not found.`
+		regexp.MustCompile(`(?i)^domain (name )?("\S+" )?not found`),
 		regexp.MustCompile(`(?i)^(the queried )?object does not exist`),
-		keyLine(`(?:domain |registration )?(?:status|state)`, `\s*(?:free|available|no object found)`),
+		keyLine(`(?:domain |registration )?(?:status|state)`, `\s*(?:free|available|no object found|not registered)`),
+		// PKNIC states it twice; the second line is the unambiguous one.
+		keyLine(`available`, `\s*yes\b`),
 		regexp.MustCompile(`(?i)^no information (available about domain name|was found matching)`),
 		regexp.MustCompile(`(?i)^available$`),
 		regexp.MustCompile(`(?i)\b(is )?(available|free) for registration\b`),
 		// "<domain> is free" as a whole line -- anchored at both ends so the
 		// phrase cannot match inside a terms-of-use paragraph.
 		regexp.MustCompile(`(?i)^\S+ is (free|available)$`),
-		// NIC Argentina answers in Spanish.
+		// TWNIC's phrasing, verbatim.
+		regexp.MustCompile(`(?i)^no found\b`),
+		// .pt prefixes the verdict with the name: `example.pt - No Match`.
+		regexp.MustCompile(`(?i)^\S+ - no match\b`),
+		// HKIRC and KISA (.kr) answer in prose rather than a status field.
+		regexp.MustCompile(`(?i)^the domain has not been registered\b`),
+		regexp.MustCompile(`(?i)^the requested domain was not found\b`),
+		// NIC Argentina answers in Spanish, .hu bilingually in Hungarian first.
 		regexp.MustCompile(`(?i)^el dominio no se encuentra registrado`),
+		regexp.MustCompile(`(?i)^nincs talalat\b`),
 	}
 	// A whois host may answer for a TLD it does not serve with a refusal
 	// rather than a verdict: Identity Digital's shared server says so for the
@@ -134,12 +146,15 @@ var (
 	}
 	registeredRes = []*regexp.Regexp{
 		keyLine(`name ?servers?|nserver`, ``),
-		keyLine(`(?:domain )?(?:status|state)`, `\s*(?:connect|active|ok|registered|client|server)`),
-		keyLine(`creation date|created|registered(?: date)?|registration (?:date|time)|domain record activated`, ``),
+		// "busy" is Register.BG's word for taken: `registration status: busy, active`.
+		keyLine(`(?:domain |registration )?(?:status|state)`, `\s*(?:connect|active|ok|registered|client|server|busy)`),
+		keyLine(`creation date|created|record created|registered(?: date)?|registration (?:date|time)|domain record activated`, ``),
 		keyLine(`registrar|sponsoring registrar|registry domain id|registrant`, ``),
 		keyLine(`expiry date|expiration date|registry expiry date|paid-till`, ``),
 	}
-	commentRe    = regexp.MustCompile(`^[%#>\s]+`)
+	// Asterisks are stripped alongside the usual markers so KazNIC's
+	// `*** Nothing found for this query.` reaches the patterns below.
+	commentRe    = regexp.MustCompile(`^[%#>*\s]+`)
 	expiryLineRe = regexp.MustCompile(`(?i)expiry date|expiration date|expiration time`)
 	dateRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
 	// Anchored to the end of the line: some TLDs (.dev among them) publish an
