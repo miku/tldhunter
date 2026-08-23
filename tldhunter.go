@@ -44,9 +44,9 @@ import (
 	"time"
 )
 
-const banner = `▄▖▖ ▄ ▖▖▖▖▖ ▖▄▖
-▐ ▌ ▌▌▙▌▌▌▛▖▌▐
-▐ ▙▖▙▘▌▌▙▌▌▝▌▐
+const banner = `▄▖▖ ▄ ▖▖▖▖▖ ▖▄▖▄▖▄▖
+▐ ▌ ▌▌▙▌▌▌▛▖▌▐ ▙▖▙▘
+▐ ▙▖▙▘▌▌▙▌▌▝▌▐ ▙▖▌▌
 Domain Availability Checker
 `
 
@@ -86,6 +86,7 @@ const (
 	// Available results are the actionable ones and the ones that go stale
 	// dangerously, so they expire far sooner than taken results.
 	defaultTTLAvail = time.Hour
+	xdgCacheDir     = "tldhunter"
 )
 
 // Availability is decided by looking for an explicit "no such domain" reply
@@ -528,7 +529,7 @@ func xdgCacheDir() (string, error) {
 		}
 		base = filepath.Join(home, ".cache")
 	}
-	return filepath.Join(base, "tldhunt"), nil
+	return filepath.Join(base, xdgCacheDir), nil
 }
 
 // openCache returns nil when caching is disabled or unavailable; every cache
