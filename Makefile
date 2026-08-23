@@ -1,4 +1,4 @@
-BINARY := tldhunt
+BINARY := tldhunter
 GO     := go
 GOFLAGS := -trimpath -ldflags='-s -w'
 
@@ -9,14 +9,14 @@ all: build
 build: $(BINARY)
 
 # tlds.txt is a prerequisite because it is embedded into the binary.
-$(BINARY): tldhunt.go tlds.txt
-	$(GO) build $(GOFLAGS) -o $@ tldhunt.go
+$(BINARY): tldhunter.go tlds.txt
+	$(GO) build $(GOFLAGS) -o $@ tldhunter.go
 
 fmt:
-	gofmt -w tldhunt.go
+	gofmt -w tldhunter.go
 
 vet:
-	$(GO) vet ./tldhunt.go
+	$(GO) vet ./tldhunter.go
 
 # Refresh tlds.txt from IANA, then rebuild so the new list gets embedded.
 update-tld: $(BINARY)
