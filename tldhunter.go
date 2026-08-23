@@ -98,7 +98,9 @@ const (
 // nameservers and no "active", so the old rule reported it available.
 //
 // Patterns are matched per line, after stripping the comment markers that
-// registries use for their boilerplate.
+// registries use for their boilerplate. Field patterns are built by keyLine,
+// which is where the tolerance for how a registry separates key from value
+// lives.
 var (
 	availableRes = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)^no match`),
@@ -109,7 +111,7 @@ var (
 		regexp.MustCompile(`(?i)^nothing found`),
 		regexp.MustCompile(`(?i)^domain (name )?not found`),
 		regexp.MustCompile(`(?i)^(the queried )?object does not exist`),
-		regexp.MustCompile(`(?i)^(domain |registration )?(status|state):\s*(free|available|no object found)`),
+		keyLine(`(?:domain |registration )?(?:status|state)`, `\s*(?:free|available|no object found)`),
 		regexp.MustCompile(`(?i)^no information (available about domain name|was found matching)`),
 		regexp.MustCompile(`(?i)^available$`),
 		regexp.MustCompile(`(?i)\b(is )?(available|free) for registration\b`),
@@ -131,11 +133,11 @@ var (
 		regexp.MustCompile(`(?i)but this server does not have`),
 	}
 	registeredRes = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)^(name ?servers?|nserver):`),
-		regexp.MustCompile(`(?i)^(domain )?(status|state):\s*(connect|active|ok|registered|client|server)`),
-		regexp.MustCompile(`(?i)^(creation date|created|registered|registration (date|time)|domain record activated):`),
-		regexp.MustCompile(`(?i)^(registrar|sponsoring registrar|registry domain id|registrant):`),
-		regexp.MustCompile(`(?i)^(expiry date|expiration date|registry expiry date|paid-till):`),
+		keyLine(`name ?servers?|nserver`, ``),
+		keyLine(`(?:domain )?(?:status|state)`, `\s*(?:connect|active|ok|registered|client|server)`),
+		keyLine(`creation date|created|registered(?: date)?|registration (?:date|time)|domain record activated`, ``),
+		keyLine(`registrar|sponsoring registrar|registry domain id|registrant`, ``),
+		keyLine(`expiry date|expiration date|registry expiry date|paid-till`, ``),
 	}
 	commentRe    = regexp.MustCompile(`^[%#>\s]+`)
 	expiryLineRe = regexp.MustCompile(`(?i)expiry date|expiration date|expiration time`)
@@ -144,6 +146,23 @@ var (
 	// empty "whois:" field, and \s* would otherwise run on into the next line.
 	ianaWhoisRe = regexp.MustCompile(`(?im)^whois:[ \t]*(\S+)[ \t]*$`)
 )
+
+// keyLine builds a matcher for one whois field, anchored to the start of a
+// line and followed by tail (usually empty; a value pattern for status fields).
+//
+// The separator is the permissive part, because registries write it three ways:
+//
+//	Name Server: ns1.example.com          the common form
+//	nserver............: ns1.example.com  padded or dotted leaders (.fi, .kr)
+//	[Name Server]        ns1.example.com  bracketed, no colon at all (JPRS)
+//
+// tldhunt.sh caught all three by accident -- it grepped anywhere in the line,
+// which is also why an unrecognised response read as an available domain.
+// Anchoring is what makes the avail-first rule in parseResult safe, so the
+// separator absorbs the variation instead of the anchor.
+func keyLine(keys, tail string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)^\[?(?:` + keys + `)(?:\][ \t]|[ \t.]*:)` + tail)
+}
 
 // Color definitions.
 var (
