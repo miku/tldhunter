@@ -1,8 +1,6 @@
 # tldhunter (domain availability checker)
 
-A WIP Go rewrite and extension of
-[TLDHunt](https://github.com/yuyudhn/TLDHunt). A CLI to check domain name
-availability.
+A WIP Go rewrite and extension of [TLDHunt](https://github.com/yuyudhn/TLDHunt). A CLI to check domain name availability.
 
 ![](static/2026-08-23-tldhunter.png)
 
