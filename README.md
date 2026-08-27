@@ -4,7 +4,22 @@ A WIP Go rewrite and extension of [TLDHunt](https://github.com/yuyudhn/TLDHunt).
 
 ![](static/2026-08-23-tldhunter.png)
 
-# How It Works?
+## Usage
+
+```
+$ tldhunter -h
+Usage: tldhunter -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [--update-tld]
+Without -e or -E, the built-in TLD list (1438 entries) is used,
+unless the keyword already ends in a known TLD, which checks just that domain.
+Results are cached in /Users/tir/.cache/tldhunter for 24h0m0s (1h0m0s if available; -ttl 0 to disable).
+Example: ./tldhunter -k linuxsec
+       : ./tldhunter -k delta.sh
+       : ./tldhunter -k linuxsec -E tlds.txt
+       : ./tldhunter --update-tld
+       : ./tldhunter --clear-cache
+```
+
+## How It Works?
 
 Everything lives in a single file, [tldhunter.go](tldhunter.go), and uses only
 the standard library -- no `whois(1)`, no `curl(1)`.
