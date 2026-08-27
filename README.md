@@ -14,16 +14,21 @@ $ go install github.com/miku/tldhunter@latest
 
 ```
 $ tldhunter -h
-Usage: tldhunter -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [--update-tld]
+Usage: tldhunter -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [-v] [--update-tld]
 Without -e or -E, the built-in TLD list (1438 entries) is used,
 unless the keyword already ends in a known TLD, which checks just that domain.
 Results are cached in /Users/tir/.cache/tldhunter for 24h0m0s (1h0m0s if available; -ttl 0 to disable).
 Example: ./tldhunter -k linuxsec
        : ./tldhunter -k delta.sh
        : ./tldhunter -k linuxsec -E tlds.txt
+       : ./tldhunter -k linuxsec -e .dev -v
        : ./tldhunter --update-tld
        : ./tldhunter --clear-cache
 ```
+
+`-v` (or `--verbose`) dumps every whois and RDAP response to stderr, prefixed
+with `[debug]`, along with failed attempts and cache hits. Results still go to
+stdout, so `tldhunter -k linuxsec -v 2>debug.log` keeps the two apart.
 
 ## How It Works?
 

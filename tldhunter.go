@@ -21,6 +21,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -202,7 +203,7 @@ func colorEnabled() bool {
 
 func usage() {
 	prog := os.Args[0]
-	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [--update-tld]\n", prog)
+	fmt.Fprintf(os.Stderr, "Usage: %s -k <keyword|domain> [-e <tld> | -E <tld-file>] [-x] [-v] [--update-tld]\n", prog)
 	fmt.Fprintf(os.Stderr, "Without -e or -E, the built-in TLD list (%d entries) is used,\n", len(embeddedList()))
 	fmt.Fprintf(os.Stderr, "unless the keyword already ends in a known TLD, which checks just that domain.\n")
 	if dir, err := xdgCacheDir(); err == nil {
@@ -211,6 +212,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Example: %s -k linuxsec\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s -k delta.sh\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s -k linuxsec -E tlds.txt\n", prog)
+	fmt.Fprintf(os.Stderr, "       : %s -k linuxsec -e .dev -v\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s --update-tld\n", prog)
 	fmt.Fprintf(os.Stderr, "       : %s --clear-cache\n", prog)
 	os.Exit(1)
@@ -252,6 +254,8 @@ func main() {
 	flag.DurationVar(&ttl, "ttl", defaultTTL, "cache lifetime for results; 0 disables the cache")
 	flag.DurationVar(&ttlAvail, "ttl-avail", defaultTTLAvail, "cache lifetime for available results; 0 to never cache them")
 	flag.BoolVar(&clear, "clear-cache", false, "delete the cache directory and exit")
+	flag.BoolVar(&verbose, "v", false, "dump server responses to stderr")
+	flag.BoolVar(&verbose, "verbose", false, "dump server responses to stderr")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -411,6 +415,7 @@ func updateTLDFile(path string) error {
 		return fmt.Errorf("fetching %s: %w", tldURL, err)
 	}
 	defer resp.Body.Close()
+	debugf("GET %s -> %s", tldURL, resp.Status)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetching %s: %s", tldURL, resp.Status)
 	}
@@ -446,19 +451,58 @@ type config struct {
 	cache   *cache // nil when caching is disabled
 }
 
+// outMu serializes output so concurrent workers cannot interleave lines. It is
+// package-level rather than a printer field because the verbose dumps take it
+// too, and they are written from the query paths, several calls below the last
+// one holding a printer.
+var outMu sync.Mutex
+
 // printer serializes output so concurrent workers cannot interleave lines.
-type printer struct{ mu sync.Mutex }
+type printer struct{}
 
 func (p *printer) out(format string, args ...any) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	outMu.Lock()
+	defer outMu.Unlock()
 	fmt.Printf(format+"\n", args...)
 }
 
 func (p *printer) err(format string, args ...any) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	outMu.Lock()
+	defer outMu.Unlock()
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+// verbose is set by -v and makes every server response, and every failed
+// attempt at one, land on stderr. It is a package-level switch for the same
+// reason outMu is: config does not reach that far down.
+var verbose bool
+
+func debugf(format string, args ...any) {
+	if !verbose {
+		return
+	}
+	outMu.Lock()
+	defer outMu.Unlock()
+	fmt.Fprintf(os.Stderr, "[debug] "+format+"\n", args...)
+}
+
+// debugBody dumps a response under a one-line header, prefixing every line of
+// the body so that a record which itself looks like log output cannot be
+// mistaken for one.
+func debugBody(header, body string) {
+	if !verbose {
+		return
+	}
+	outMu.Lock()
+	defer outMu.Unlock()
+	fmt.Fprintf(os.Stderr, "[debug] %s\n", header)
+	if body = strings.TrimRight(body, "\n"); body == "" {
+		fmt.Fprintln(os.Stderr, "[debug] | (empty response)")
+		return
+	}
+	for _, line := range strings.Split(body, "\n") {
+		fmt.Fprintf(os.Stderr, "[debug] | %s\n", line)
+	}
 }
 
 // The on-disk cache lives under the XDG base directory, one small JSON file
@@ -761,6 +805,9 @@ func resolveServers(keyword string, tlds []string, servers *serverCache, cfg con
 				var cached result
 				if age, ok := cfg.cache.get(cacheDomains, domain, &cached); ok && age <= cfg.cache.ttlFor(cached.Status) {
 					cfg.cache.hit(cacheDomains)
+					// Worth saying under -v: a cached verdict is why no
+					// server was asked about this domain at all.
+					debugf("cache hit %s -> %s (age %s)", domain, cached.Status, age.Round(time.Second))
 					if line := cached.format(domain, cfg.nreg); line != "" {
 						p.out("%s", line)
 					}
@@ -1003,8 +1050,10 @@ func whoisQuery(server, query string, cfg config) (string, error) {
 	for attempt := 0; ; attempt++ {
 		var body string
 		if body, err = whoisQueryOnce(server, query, cfg.timeout); err == nil {
+			debugBody(fmt.Sprintf("whois %s < %q (attempt %d)", server, query, attempt+1), body)
 			return body, nil
 		}
+		debugf("whois %s < %q (attempt %d) failed: %v", server, query, attempt+1, err)
 		if attempt >= cfg.retries || !retryable(err) {
 			return "", err
 		}
@@ -1217,6 +1266,8 @@ func fetchBootstrap(timeout time.Duration) (map[string]string, error) {
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("%s listed no RDAP servers", rdapBootstrapURL)
 	}
+	// The document itself runs to megabytes, so report its shape, not its body.
+	debugf("rdap bootstrap: %d services, %d TLDs", len(doc.Services), len(servers))
 	return servers, nil
 }
 
@@ -1357,8 +1408,20 @@ func rdapQueryOnce(url string, timeout time.Duration) (result, error) {
 	}
 	defer body.Close()
 
+	var r io.Reader = io.LimitReader(body, rdapMaxBody)
+	if verbose {
+		// Buffer only when dumping, so the normal path still decodes as it
+		// streams.
+		raw, err := io.ReadAll(r)
+		if err != nil {
+			return result{}, fmt.Errorf("reading RDAP response: %w", err)
+		}
+		debugBody("rdap GET "+url, string(raw))
+		r = bytes.NewReader(raw)
+	}
+
 	var d rdapDomain
-	if err := json.NewDecoder(io.LimitReader(body, rdapMaxBody)).Decode(&d); err != nil {
+	if err := json.NewDecoder(r).Decode(&d); err != nil {
 		return result{}, fmt.Errorf("decoding RDAP response: %w", err)
 	}
 	// A 200 carrying an error document, or one carrying no domain at all, is
@@ -1386,12 +1449,21 @@ func httpGet(url, accept string, timeout time.Duration) (io.ReadCloser, error) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		cancel()
+		debugf("GET %s failed: %v", url, err)
 		return nil, err
 	}
+	debugf("GET %s -> %s", url, resp.Status)
 	if resp.StatusCode/100 != 2 {
 		// Drain before closing so the connection can be reused for the next
 		// TLD on this host; error bodies are small.
-		io.Copy(io.Discard, io.LimitReader(resp.Body, rdapMaxBody))
+		if verbose {
+			// Same drain, but shown rather than discarded: an error document
+			// usually says more than the status code does.
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, rdapMaxBody))
+			debugBody(fmt.Sprintf("GET %s error body", url), string(raw))
+		} else {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, rdapMaxBody))
+		}
 		resp.Body.Close()
 		cancel()
 		return nil, rdapStatusError{code: resp.StatusCode, after: retryAfter(resp.Header)}
