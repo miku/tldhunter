@@ -4,6 +4,12 @@ A WIP Go rewrite and extension of [TLDHunt](https://github.com/yuyudhn/TLDHunt).
 
 ![](static/2026-08-23-tldhunter.png)
 
+## Installation
+
+```
+$ go install github.com/miku/tldhunter@latest
+```
+
 ## Usage
 
 ```
